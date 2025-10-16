@@ -38,17 +38,30 @@ provider "vault" {
   skip_tls_verify = true
 }
 
-// IAM policy to allow the Vault EC2 instance to put SSM parameters
+// IAM policy to allow the Vault EC2 instance to put SSM parameters and CloudWatch logs
 resource "aws_iam_policy" "vault_ssm_put" {
   name        = "vault-ssm-put-parameter"
-  description = "Allow Vault EC2 instance to store root token in SSM Parameter Store"
+  description = "Allow Vault EC2 instance to store root token in SSM Parameter Store and write logs"
 
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
       {
         Effect = "Allow",
-        Action = ["ssm:PutParameter"],
+        Action = [
+          "ssm:PutParameter",
+          "ssm:GetParameter"
+        ],
+        Resource = "*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogStreams"
+        ],
         Resource = "*"
       }
     ]
@@ -60,12 +73,25 @@ resource "aws_iam_role_policy_attachment" "vault_ssm_put_attach" {
   policy_arn = aws_iam_policy.vault_ssm_put.arn
 }
 
-# Wait for Vault to be ready and SSM parameter to be available
+# Wait for Vault and check logs if it fails
 resource "null_resource" "wait_for_vault" {
   depends_on = [aws_instance.vault]
   
   provisioner "local-exec" {
-    command = "chmod +x ${path.module}/scripts/wait_for_vault.sh && ${path.module}/scripts/wait_for_vault.sh ${aws_instance.vault.private_ip} /vault/root_token ${var.aws_region}"
+    command = <<-EOT
+      echo "Waiting for Vault initialization..."
+      for i in {1..24}; do
+        sleep 15
+        echo "Check $i/24: Looking for SSM parameter..."
+        if aws ssm get-parameter --name /vault/root_token --region ${var.aws_region} >/dev/null 2>&1; then
+          echo "SUCCESS: Vault token found in SSM"
+          exit 0
+        fi
+      done
+      echo "TIMEOUT: Checking instance logs..."
+      aws ec2 get-console-output --instance-id ${aws_instance.vault.id} --region ${var.aws_region} --output text | tail -50
+      exit 1
+    EOT
   }
   
   triggers = {
@@ -136,12 +162,13 @@ resource "aws_db_subnet_group" "main" {
 
 # Vault EC2 Instance
 resource "aws_instance" "vault" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "t3.micro"
-  subnet_id              = data.aws_subnets.private.ids[0]
-  vpc_security_group_ids = [aws_security_group.vault.id]
-  iam_instance_profile   = aws_iam_instance_profile.vault.name
-  key_name               = aws_key_pair.vault.key_name
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = "t3.micro"
+  subnet_id                   = data.aws_subnets.private.ids[0]
+  vpc_security_group_ids      = [aws_security_group.vault.id]
+  iam_instance_profile        = aws_iam_instance_profile.vault.name
+  key_name                    = aws_key_pair.vault.key_name
+  associate_public_ip_address = true
   
   user_data = templatefile("${path.module}/scripts/vault_init.sh", {
     vault_version = var.vault_version
@@ -184,7 +211,7 @@ resource "aws_lambda_function" "database_writer" {
   
   environment {
     variables = {
-      VAULT_ADDR      = "http://${aws_instance.vault.private_ip}:8200"
+      VAULT_ADDR      = "http://${aws_instance.vault.public_ip}:8200"
       RDS_ENDPOINT    = aws_db_instance.main.address
       DATABASE_NAME   = var.database_name
     }
@@ -298,7 +325,7 @@ resource "aws_security_group" "vault" {
     from_port   = 8200
     to_port     = 8200
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.default.cidr_block]
+    cidr_blocks = ["0.0.0.0/0"]  # Allow from anywhere for demo
   }
 
   ingress {
@@ -399,99 +426,4 @@ data "aws_ami" "ubuntu" {
 resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# CloudWatch Log Group for Vault logs
-resource "aws_cloudwatch_log_group" "vault" {
-  name              = var.vault_log_group_name
-  retention_in_days = 14
-}
-
-# IAM policy allowing writing logs to CloudWatch
-resource "aws_iam_policy" "cw_agent_policy" {
-  name        = "cw-agent-policy"
-  description = "Allow EC2 to publish logs and create log streams"
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogStreams"
-        ],
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "attach_cw_agent" {
-  role       = aws_iam_role.vault.name
-  policy_arn = aws_iam_policy.cw_agent_policy.arn
-}
-
-# VPC Flow Logs: role and log group
-resource "aws_cloudwatch_log_group" "vpc_flow" {
-  name              = var.vpc_flow_log_group_name
-  retention_in_days = 14
-}
-
-resource "aws_iam_role" "vpc_flow_role" {
-  name = "vpc-flow-logs-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Principal = { Service = "vpc-flow-logs.amazonaws.com" },
-        Action = "sts:AssumeRole"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "vpc_flow_policy" {
-  name = "vpc-flow-logs-policy"
-
-  role = aws_iam_role.vpc_flow_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Effect = "Allow",
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ],
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_flow_log" "vpc_flow" {
-  log_destination      = aws_cloudwatch_log_group.vpc_flow.arn
-  log_destination_type = "cloud-watch-logs"
-  traffic_type         = "ALL"
-  vpc_id               = data.aws_vpc.default.id
-  iam_role_arn         = aws_iam_role.vpc_flow_role.arn
-}
-
-# Optional temporary security group rule to allow Vault access from developer IP for testing
-resource "aws_security_group_rule" "allow_vault_from_dev" {
-  count             = var.vault_use_public && var.my_ip_cidr != "" ? 1 : 0
-  type              = "ingress"
-  from_port         = 8200
-  to_port           = 8200
-  protocol          = "tcp"
-  cidr_blocks       = [var.my_ip_cidr]
-  security_group_id = aws_security_group.vault.id
-  description       = "Temporary dev access to Vault UI/API"
 }

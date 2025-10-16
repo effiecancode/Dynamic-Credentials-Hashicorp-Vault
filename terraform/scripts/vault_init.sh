@@ -94,41 +94,7 @@ if ! curl -s -f http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
 fi
 
 # Install jq and AWS CLI (for uploading token to SSM)
-apt-get install -y jq python3 python3-pip
-pip3 install --upgrade awscli
-
-# Install CloudWatch Agent
-apt-get install -y wget unzip
-CWAGENT_DEB="amazon-cloudwatch-agent.deb"
-wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb -O $CWAGENT_DEB
-dpkg -i $CWAGENT_DEB || true
-
-# Create cloudwatch-agent config to send Vault init logs and cloud-init output
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << CWA
-{
-  "logs": {
-    "logs_collected": {
-      "files": {
-        "collect_list": [
-          {
-            "file_path": "/var/log/vault-init.log",
-            "log_group_name": "${vault_log_group}",
-            "log_stream_name": "{instance_id}/vault-init"
-          },
-          {
-            "file_path": "/var/log/cloud-init-output.log",
-            "log_group_name": "${vault_log_group}",
-            "log_stream_name": "{instance_id}/cloud-init-output"
-          }
-        ]
-      }
-    }
-  }
-}
-CWA
-
-# Start the CloudWatch Agent
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s || true
+apt-get install -y jq awscli
 
 # Initialize Vault (NOT for production — demo initialization)
 export VAULT_ADDR='http://127.0.0.1:8200'
