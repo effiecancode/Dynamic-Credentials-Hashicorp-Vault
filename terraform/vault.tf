@@ -2,6 +2,8 @@
 resource "vault_mount" "database" {
   path = "database"
   type = "database"
+  
+  depends_on = [null_resource.wait_for_vault]
 }
 
 # Database Secrets Engine Configuration
@@ -42,6 +44,8 @@ resource "vault_database_secret_backend_role" "lambda" {
 # Enable AWS Auth Method
 resource "vault_auth_backend" "aws" {
   type = "aws"
+  
+  depends_on = [null_resource.wait_for_vault]
 }
 
 # Configure AWS Auth Method

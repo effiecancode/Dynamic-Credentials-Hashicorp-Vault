@@ -75,8 +75,23 @@ EOF
 systemctl enable vault
 systemctl start vault
 
-# Wait for Vault to start
-sleep 5
+# Wait for Vault to start and verify it's responding
+echo "Waiting for Vault to start..."
+for i in {1..30}; do
+    if curl -s -f http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
+        echo "Vault is responding after $i attempts"
+        break
+    fi
+    echo "Attempt $i: Vault not yet responding, waiting..."
+    sleep 10
+done
+
+# Verify Vault is actually running
+if ! curl -s -f http://127.0.0.1:8200/v1/sys/health > /dev/null 2>&1; then
+    echo "ERROR: Vault failed to start properly" | tee -a /var/log/vault-init.log
+    systemctl status vault | tee -a /var/log/vault-init.log
+    exit 1
+fi
 
 # Install jq and AWS CLI (for uploading token to SSM)
 apt-get install -y jq python3 python3-pip
@@ -117,17 +132,56 @@ CWA
 
 # Initialize Vault (NOT for production — demo initialization)
 export VAULT_ADDR='http://127.0.0.1:8200'
-vault operator init -key-shares=1 -key-threshold=1 -format=json | tee /var/log/vault-init.log > /tmp/vault-init.json
+echo "Initializing Vault..." | tee -a /var/log/vault-init.log
+
+# Check if Vault is already initialized
+if vault status 2>/dev/null | grep -q "Initialized.*true"; then
+    echo "Vault is already initialized" | tee -a /var/log/vault-init.log
+    exit 0
+fi
+
+# Initialize Vault
+if ! vault operator init -key-shares=1 -key-threshold=1 -format=json | tee /var/log/vault-init.log > /tmp/vault-init.json; then
+    echo "ERROR: Failed to initialize Vault" | tee -a /var/log/vault-init.log
+    exit 1
+fi
 
 # Extract unseal key and root token
 UNSEAL_KEY=$(jq -r '.unseal_keys_b64[0]' /tmp/vault-init.json)
 ROOT_TOKEN=$(jq -r '.root_token' /tmp/vault-init.json)
 
+if [ -z "$UNSEAL_KEY" ] || [ -z "$ROOT_TOKEN" ] || [ "$UNSEAL_KEY" = "null" ] || [ "$ROOT_TOKEN" = "null" ]; then
+    echo "ERROR: Failed to extract unseal key or root token" | tee -a /var/log/vault-init.log
+    exit 1
+fi
+
 # Unseal Vault
-vault operator unseal $UNSEAL_KEY
+echo "Unsealing Vault..." | tee -a /var/log/vault-init.log
+if ! vault operator unseal $UNSEAL_KEY; then
+    echo "ERROR: Failed to unseal Vault" | tee -a /var/log/vault-init.log
+    exit 1
+fi
+
+# Verify Vault is unsealed and ready
+for i in {1..10}; do
+    if vault status 2>/dev/null | grep -q "Sealed.*false"; then
+        echo "Vault is unsealed and ready" | tee -a /var/log/vault-init.log
+        break
+    fi
+    echo "Waiting for Vault to be unsealed... attempt $i" | tee -a /var/log/vault-init.log
+    sleep 5
+done
 
 # Store root token into SSM Parameter Store as SecureString
 SSM_PARAM_NAME="/vault/root_token"
-aws ssm put-parameter --name "$SSM_PARAM_NAME" --value "$ROOT_TOKEN" --type "SecureString" --overwrite --region "${aws_region}"
+echo "Storing root token in SSM Parameter Store..." | tee -a /var/log/vault-init.log
+if aws ssm put-parameter --name "$SSM_PARAM_NAME" --value "$ROOT_TOKEN" --type "SecureString" --overwrite --region "${aws_region}"; then
+    echo "SUCCESS: Vault installation completed and root token stored in SSM at $SSM_PARAM_NAME" | tee -a /var/log/vault-init.log
+else
+    echo "ERROR: Failed to store root token in SSM" | tee -a /var/log/vault-init.log
+    exit 1
+fi
 
-echo "Vault installation completed and root token stored in SSM at $SSM_PARAM_NAME"
+# Clean up sensitive files
+rm -f /tmp/vault-init.json
+echo "Vault initialization completed successfully" | tee -a /var/log/vault-init.log

@@ -33,6 +33,9 @@ provider "vault" {
   address = var.vault_use_public ? "http://${aws_instance.vault.public_ip}:8200" : "http://${aws_instance.vault.private_ip}:8200"
   # Read the root token from SSM after the instance initialization script stores it
   token   = length(data.external.vault_root.result.value) > 0 ? data.external.vault_root.result.value : var.vault_token
+  
+  # Skip TLS verification for demo purposes
+  skip_tls_verify = true
 }
 
 // IAM policy to allow the Vault EC2 instance to put SSM parameters
@@ -57,9 +60,23 @@ resource "aws_iam_role_policy_attachment" "vault_ssm_put_attach" {
   policy_arn = aws_iam_policy.vault_ssm_put.arn
 }
 
+# Wait for Vault to be ready and SSM parameter to be available
+resource "null_resource" "wait_for_vault" {
+  depends_on = [aws_instance.vault]
+  
+  provisioner "local-exec" {
+    command = "chmod +x ${path.module}/scripts/wait_for_vault.sh && ${path.module}/scripts/wait_for_vault.sh ${aws_instance.vault.private_ip} /vault/root_token ${var.aws_region}"
+  }
+  
+  triggers = {
+    instance_id = aws_instance.vault.id
+  }
+}
+
 # External data source that safely reads the SSM parameter (returns empty string when missing)
 data "external" "vault_root" {
   program = ["/bin/bash", "${path.module}/scripts/get_ssm_param.sh", "/vault/root_token", var.aws_region]
+  depends_on = [null_resource.wait_for_vault]
 }
 
 # Data sources for default VPC and subnets
@@ -183,7 +200,8 @@ resource "aws_lambda_function" "database_writer" {
     aws_instance.vault,
     vault_database_secret_backend_role.lambda,
     vault_aws_auth_backend_role.lambda,
-    null_resource.build_lambda
+    null_resource.build_lambda,
+    null_resource.wait_for_vault
   ]
 }
 
@@ -234,6 +252,15 @@ resource "aws_iam_role_policy" "lambda_vault_auth" {
           "logs:PutLogEvents"
         ]
         Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
       }
     ]
   })
