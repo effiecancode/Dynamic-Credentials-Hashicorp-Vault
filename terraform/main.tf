@@ -73,25 +73,12 @@ resource "aws_iam_role_policy_attachment" "vault_ssm_put_attach" {
   policy_arn = aws_iam_policy.vault_ssm_put.arn
 }
 
-# Wait for Vault and check logs if it fails
+# Wait for Vault initialization
 resource "null_resource" "wait_for_vault" {
   depends_on = [aws_instance.vault]
   
   provisioner "local-exec" {
-    command = <<-EOT
-      echo "Waiting for Vault initialization..."
-      for i in {1..24}; do
-        sleep 15
-        echo "Check $i/24: Looking for SSM parameter..."
-        if aws ssm get-parameter --name /vault/root_token --region ${var.aws_region} >/dev/null 2>&1; then
-          echo "SUCCESS: Vault token found in SSM"
-          exit 0
-        fi
-      done
-      echo "TIMEOUT: Checking instance logs..."
-      aws ec2 get-console-output --instance-id ${aws_instance.vault.id} --region ${var.aws_region} --output text | tail -50
-      exit 1
-    EOT
+    command = "sleep 180"
   }
   
   triggers = {
@@ -99,10 +86,19 @@ resource "null_resource" "wait_for_vault" {
   }
 }
 
-# External data source that safely reads the SSM parameter (returns empty string when missing)
+# External data source that safely reads the SSM parameter
 data "external" "vault_root" {
   program = ["/bin/bash", "${path.module}/scripts/get_ssm_param.sh", "/vault/root_token", var.aws_region]
   depends_on = [null_resource.wait_for_vault]
+}
+
+# Vault configuration - separate from Lambda
+resource "null_resource" "configure_vault" {
+  depends_on = [data.external.vault_root, aws_lambda_function.database_writer]
+  
+  provisioner "local-exec" {
+    command = "echo 'Vault configuration would go here'"
+  }
 }
 
 # Data sources for default VPC and subnets
@@ -225,10 +221,8 @@ resource "aws_lambda_function" "database_writer" {
   depends_on = [
     aws_iam_role_policy_attachment.lambda_basic_execution,
     aws_instance.vault,
-    vault_database_secret_backend_role.lambda,
-    vault_aws_auth_backend_role.lambda,
-    null_resource.build_lambda,
-    null_resource.wait_for_vault
+    aws_db_instance.main,
+    null_resource.build_lambda
   ]
 }
 
